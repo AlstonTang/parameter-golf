@@ -54,24 +54,24 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1024))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 128))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 262_144))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
-    model_dim = int(os.environ.get("MODEL_DIM", 384))
-    num_heads = int(os.environ.get("NUM_HEADS", 6))
+    num_layers = int(os.environ.get("NUM_LAYERS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 4096.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
-    embed_lr = float(os.environ.get("EMBED_LR", 0.5))
+    embed_lr = float(os.environ.get("EMBED_LR", 0.4))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.02))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.0075))
@@ -639,10 +639,11 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(0.125))
+        self.emb_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(0.025))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
-    def forward(self, x: Tensor) -> Tensor:
-        y = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
+        y = self.emb_scale.to(dtype=x.dtype)[None, None, :] * emb + x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x))
         return self.resid_scale.to(dtype=x.dtype)[None, None, :] * x + y + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(y))
 
 
@@ -684,7 +685,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_layers = num_layers
-        self.blocks = nn.Sequential(*[
+        self.blocks = nn.ModuleList([
             Block(
                 model_dim,
                 num_heads,
@@ -714,10 +715,11 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
+        emb = self.tok_emb(input_ids)
+        x = F.rms_norm(emb, (emb.size(-1),))
 
-        x = self.blocks(x)
+        for block in self.blocks:
+            x = block(x, emb)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -764,7 +766,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = 1 #8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
