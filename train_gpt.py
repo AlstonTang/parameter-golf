@@ -54,7 +54,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1024))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 128))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 262_144))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -62,12 +62,12 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 12))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 6))
+    model_dim = int(os.environ.get("MODEL_DIM", 384))
+    num_heads = int(os.environ.get("NUM_HEADS", 6))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 2048.0))
+    rope_base = float(os.environ.get("ROPE_BASE", 4096.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -78,7 +78,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.9))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 4))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 192))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -539,11 +539,8 @@ class Rotary(nn.Module):
         return self.cos, self.sin
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    out = torch.empty_like(x)
-    half = x.size(-1) // 2
-    out[..., :half] = x[..., :half] * cos - x[..., half:] * sin
-    out[..., half:] = x[..., :half] * sin + x[..., half:] * cos
-    return out
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -607,7 +604,6 @@ def calculate_hidden(mlp_mult: int, dim: int):
     raw_hidden = int(mlp_mult * dim // 1.5)
     multiplier = raw_hidden / 64
     return 64 if multiplier == 0 else (2**round(math.log2(multiplier))) * 64
-
 
 class MLP(nn.Module):
     # Using SwiGLU as introduced in Shazeer (2020)
@@ -706,8 +702,7 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
-        ramp = torch.linspace(0.0, 1.0, ramp_len)
-        # Assuming args.train_seq_len is 1024
+        ramp = torch.sin(torch.linspace(0, math.pi/2, ramp_len))**2
         full_mask = torch.cat([ramp, torch.ones(seq_len - ramp_len)])
         self.register_buffer("loss_mask", full_mask, persistent=False)
 
@@ -732,10 +727,6 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
 
-        logits.div_(self.logit_softcap)
-        torch.tanh_(logits) 
-        logits = logits * self.logit_softcap 
-
         # --- MODIFIED LOSS CALCULATION ---
         if self.training:
             # reduction='none' gives us a loss value for every single token
@@ -750,7 +741,6 @@ class GPT(nn.Module):
             
             return weighted_loss.mean()
         else:
-            # Validation remains standard mean cross-entropy
             return F.cross_entropy(logits.float(), targets)
 
 
@@ -774,7 +764,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size if distributed else 1
+    grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
