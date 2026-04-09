@@ -61,14 +61,13 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
+    num_layers = int(os.environ.get("NUM_LAYERS", 14))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 4096.0))
-    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    rope_base = float(os.environ.get("ROPE_BASE", 2048.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.4))
@@ -510,7 +509,6 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
 
-    @torch._dynamo.disable
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
@@ -615,6 +613,7 @@ class Block(nn.Module):
         qk_gain_init: float,
         seq_len: int=1024,
         use_rope: bool=True,
+        resid_scale: float=0.125,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -622,7 +621,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, seq_len, use_rope)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(0.125))
+        self.resid_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(resid_scale))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
@@ -631,12 +630,16 @@ class Block(nn.Module):
         return self.resid_scale.to(dtype=x.dtype)[None, None, :] * x + y + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(y))
 
 
-def get_diamond_kv_heads(layer_idx, total_layers, num_heads, p=2.0):
-    midpoint = (total_layers - 1) / 2
-    norm_dist = abs(layer_idx - midpoint) / midpoint
-    curve = norm_dist ** p
-    max_kv = max(1, num_heads // 2)
-    raw_kv = 1 + (max_kv - 1) * curve
+def get_linear_progression_kv_heads(layer_idx, total_layers, num_heads):
+    # Progresses from 2 heads at layer 0 to num_heads at the final layer
+    min_kv = 2
+    max_kv = num_heads
+    
+    # Simple linear interpolation from layer 0 to total_layers
+    fraction = layer_idx / (total_layers - 1)
+    raw_kv = min_kv + (max_kv - min_kv) * fraction
+    
+    # Constraints: Must be power of 2 and divide num_heads
     kv_heads = 2 ** round(math.log2(raw_kv))
     while num_heads % kv_heads != 0:
         kv_heads //= 2
@@ -655,30 +658,26 @@ class GPT(nn.Module):
         mlp_mult: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
-        logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        ramp_len: int=32,
         seq_len: int=1024,
     ):
         super().__init__()
-        if logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
-        self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_layers = num_layers
         self.blocks = nn.ModuleList([
             Block(
                 model_dim,
                 num_heads,
-                get_diamond_kv_heads(i, num_layers, num_kv_heads),
+                get_linear_progression_kv_heads(i, num_layers, num_kv_heads),
                 mlp_mult,
                 rope_base,
                 qk_gain_init,
                 seq_len=seq_len,
-                use_rope=(i % 2 == 1)
+                use_rope=(i % 2 == 1),
+                resid_scale=1/math.sqrt(2 * num_layers)
             ) for i in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -686,10 +685,6 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
-
-        ramp = torch.sin(torch.linspace(0, math.pi/2, ramp_len))**2
-        full_mask = torch.cat([ramp, torch.ones(seq_len - ramp_len)])
-        self.register_buffer("loss_mask", full_mask, persistent=False)
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -713,21 +708,7 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
 
-        # --- MODIFIED LOSS CALCULATION ---
-        if self.training:
-            # reduction='none' gives us a loss value for every single token
-            loss = F.cross_entropy(logits.float(), targets, reduction='none')
-            
-            # Reshape loss back to [batch, seq_len] to align with our mask
-            loss = loss.view(input_ids.size(0), input_ids.size(1))
-            
-            # Apply the ramp [0.0 ... 1.0 ... 1.0]
-            # The mask broadcasts across the batch dimension automatically
-            weighted_loss = loss * self.loss_mask
-            
-            return weighted_loss.mean()
-        else:
-            return F.cross_entropy(logits.float(), targets)
+        return F.cross_entropy(logits.float(), targets)
 
 
 # -----------------------------
@@ -769,7 +750,7 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(True)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -836,7 +817,6 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         seq_len=args.train_seq_len
