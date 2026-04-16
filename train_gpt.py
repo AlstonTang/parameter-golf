@@ -290,7 +290,7 @@ def eval_val(
     # Pre-load the first batch
     raw_start = seq_start * args.train_seq_len
     raw_end = min(raw_start + local_batch_seqs * args.train_seq_len + 1, val_tokens.numel())
-    next_batch = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+    next_batch = val_tokens[raw_start:raw_end].pin_memory().to(device=device, dtype=torch.int64, non_blocking=True)
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             torch.cuda.current_stream().wait_stream(torch.cuda.default_stream())
@@ -299,7 +299,7 @@ def eval_val(
             if next_seq_start < seq_end:
                 n_raw_start = next_seq_start * args.train_seq_len
                 n_raw_end = min(n_raw_start + local_batch_seqs * args.train_seq_len + 1, val_tokens.numel())
-                next_batch = val_tokens[n_raw_start:n_raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                next_batch = val_tokens[n_raw_start:n_raw_end].pin_memory().to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
@@ -536,7 +536,7 @@ class DistributedTokenLoader:
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
         # Combine dtype conversion + device transfer in single operation
-        local = chunk[start : start + per_rank_span].to(device=self.device, dtype=torch.int64, non_blocking=True)
+        local = chunk[start : start + per_rank_span].pin_memory().to(device=self.device, dtype=torch.int64, non_blocking=True)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x, y
@@ -880,8 +880,11 @@ def main() -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, static_graph=True) if distributed else compiled_model
+    if distributed:
+        model = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False, static_graph=True)
+    else:
+        model = base_model
+    model = torch.compile(model)
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
