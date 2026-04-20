@@ -92,20 +92,34 @@ class Hyperparameters:
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
-@torch.compile
+@torch.compile(fullgraph=True)
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
-    if torch.isnan(G).any() or torch.isinf(G).any():
-         return torch.zeros_like(G)
-    a, b, c = (3.4445, -4.7750, 2.0315)
+    # 1. Eliminate CPU-GPU synchronization (Graph Break)
+    # isfinite().all() creates a scalar tensor on the device.
+    # Multiplying by this mask eliminates NaNs/Infs without a host-sync.
+    valid_mask = torch.isfinite(G).all().to(G.dtype)
+    G = G * valid_mask 
+
+    a, b, c = 3.4445, -4.7750, 2.0315
     X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
+    
+    # 2. Multiply by reciprocal (faster than tensor division)
+    X.mul_(1.0 / (X.norm() + eps))
+
+    transposed = X.size(0) > X.size(1)
     if transposed:
         X = X.T
+
     for _ in range(steps):
         A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+        
+        # 3. Fuse pointwise operations into the GEMM kernel via addmm
+        # Equivalent to: B = b * A + c * (A @ A)
+        B = torch.addmm(A, A, A, beta=b, alpha=c)
+        
+        # Equivalent to: X = a * X + 1.0 * (B @ X)
+        X = torch.addmm(X, B, X, beta=a, alpha=1.0)
+
     return X.T if transposed else X
 
 @torch.no_grad()
@@ -155,13 +169,12 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
+        self._is_initialized = False
 
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+    def _init_state(self):
+        """Pre-allocates buffers and computes static distribution logic once."""
+        if self._is_initialized:
+            return
 
         distributed = dist.is_available() and dist.is_initialized()
         world_size = dist.get_world_size() if distributed else 1
@@ -171,42 +184,98 @@ class Muon(torch.optim.Optimizer):
             params = group["params"]
             if not params:
                 continue
+
+            # 1. Pre-allocate the communication buffer ONCE
+            total_params = sum(p.numel() for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            
+            group["updates_flat"] = updates_flat
+            group["param_views"] = []
+            group["rank_params"] = []
+            group["rank_param_views"] = []
+
+            curr = 0
+            for i, p in enumerate(params):
+                numel = p.numel()
+                # 2. Pre-compute views to avoid slicing in the hot loop
+                view = updates_flat[curr : curr + numel].view_as(p)
+                group["param_views"].append(view)
+
+                # 3. Statically determine which params belong to this rank
+                if i % world_size == rank:
+                    group["rank_params"].append(p)
+                    group["rank_param_views"].append(view)
+
+                curr += numel
+
+        self._is_initialized = True
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        self._init_state()
+        distributed = dist.is_available() and dist.is_initialized()
+
+        for group in self.param_groups:
+            if not group["params"]:
+                continue
+
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            # Clear the shared buffer efficiently
+            updates_flat = group["updates_flat"]
+            updates_flat.zero_()
 
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
+            # Only iterate over parameters assigned to this rank
+            for p, view in zip(group["rank_params"], group["rank_param_views"]):
+                if p.grad is None:
+                    continue
 
+                g = p.grad
+                state = self.state[p]
+                
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                
+                # In-place momentum update
+                buf.mul_(momentum).add_(g)
+                
+                update = g.add(buf, alpha=momentum) if nesterov else g
+
+                # Assuming zeropower_via_newtonschulz5 returns a new tensor
+                g_ns = zeropower_via_newtonschulz5(update, steps=backend_steps)
+                
+                # In-place scaling
+                g_ns.mul_(max(1, g_ns.size(0) / g_ns.size(1)) ** 0.5)
+                
+                # Direct copy into the pre-sliced view of updates_flat
+                view.copy_(g_ns)
+
+            # Synchronize updates across all GPUs
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
-                curr += p.numel()
+            # 4. Kernel Fusion: Update all parameters simultaneously via foreach
+            params = group["params"]
+            views = group["param_views"]
+
+            # Avoid casting if the parameter is already bfloat16
+            if updates_flat.dtype == params[0].dtype:
+                torch._foreach_add_(params, views, alpha=-lr)
+            else:
+                # Cast quickly and apply fused update
+                casted_views = [v.to(dtype=p.dtype, non_blocking=True) for v, p in zip(views, params)]
+                torch._foreach_add_(params, casted_views, alpha=-lr)
 
         return loss
-
 
 # -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
