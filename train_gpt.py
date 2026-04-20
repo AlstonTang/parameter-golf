@@ -53,7 +53,7 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 256))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 128))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 256))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
@@ -72,14 +72,14 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.03))
     head_lr = float(os.environ.get("HEAD_LR", 0.03))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.01))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.015))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.0075))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.05))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.03))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.9))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.06))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.01))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 4))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 192))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 256))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -164,29 +164,26 @@ def apply_zero_init(model, std=0.02):
                     nn.init.zeros_(l.bias)
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
-        super().__init__(
-            params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
-        )
+    def __init__(self, params, lr: float, momentum: float = 0.95, backend_steps: int = 5, nesterov: bool = True):
+        defaults = dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov)
+        super().__init__(params, defaults)
         self._is_initialized = False
 
     def _init_state(self):
-        """Pre-allocates buffers and computes static distribution logic once."""
-        if self._is_initialized:
-            return
-
+        """Pre-allocates buffers for each group individually."""
         distributed = dist.is_available() and dist.is_initialized()
         world_size = dist.get_world_size() if distributed else 1
         rank = dist.get_rank() if distributed else 0
 
         for group in self.param_groups:
-            params = group["params"]
-            if not params:
+            # Check if THIS specific group needs initialization
+            if "updates_flat" in group or not group["params"]:
                 continue
 
-            # 1. Pre-allocate the communication buffer ONCE
+            params = group["params"]
             total_params = sum(p.numel() for p in params)
+            
+            # Pre-allocate the communication buffer for this group
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
             
             group["updates_flat"] = updates_flat
@@ -197,28 +194,19 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for i, p in enumerate(params):
                 numel = p.numel()
-                # 2. Pre-compute views to avoid slicing in the hot loop
                 view = updates_flat[curr : curr + numel].view_as(p)
                 group["param_views"].append(view)
 
-                # 3. Statically determine which params belong to this rank
                 if i % world_size == rank:
                     group["rank_params"].append(p)
                     group["rank_param_views"].append(view)
 
                 curr += numel
 
-        self._is_initialized = True
-
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
+        loss = closure() if closure is not None else None
         self._init_state()
-        distributed = dist.is_available() and dist.is_initialized()
 
         for group in self.param_groups:
             if not group["params"]:
@@ -228,12 +216,11 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
-
-            # Clear the shared buffer efficiently
             updates_flat = group["updates_flat"]
+
             updates_flat.zero_()
 
-            # Only iterate over parameters assigned to this rank
+            # 1. Local Computation
             for p, view in zip(group["rank_params"], group["rank_param_views"]):
                 if p.grad is None:
                     continue
@@ -243,37 +230,38 @@ class Muon(torch.optim.Optimizer):
                 
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
+                
                 buf = state["momentum_buffer"]
                 
-                # In-place momentum update
+                # Momentum update: m = m * momentum + g
                 buf.mul_(momentum).add_(g)
                 
-                update = g.add(buf, alpha=momentum) if nesterov else g
+                # Nesterov logic: use (g + momentum * m) or just m
+                u = g.add(buf, alpha=momentum) if nesterov else buf
 
-                # Assuming zeropower_via_newtonschulz5 returns a new tensor
-                g_ns = zeropower_via_newtonschulz5(update, steps=backend_steps)
+                # Apply Newton-Schulz (on 2D flattened version if ndim > 2)
+                original_shape = u.shape
+                if u.ndim > 2:
+                    u = u.view(u.size(0), -1)
                 
-                # In-place scaling
-                g_ns.mul_(max(1, g_ns.size(0) / g_ns.size(1)) ** 0.5)
+                g_ns = zeropower_via_newtonschulz5(u, steps=backend_steps)
                 
-                # Direct copy into the pre-sliced view of updates_flat
-                view.copy_(g_ns)
+                # Scaling factor (standard for Muon)
+                g_ns.mul_(max(1, g_ns.size(0) / g_ns.size(1))**0.5)
+                
+                view.copy_(g_ns.view(original_shape))
 
-            # Synchronize updates across all GPUs
-            if distributed:
+            # 2. Distributed Sync
+            if dist.is_available() and dist.is_initialized():
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            # 4. Kernel Fusion: Update all parameters simultaneously via foreach
+            # 3. Parameter Update (Kernel Fusion)
+            # Use foreach_add with a list of tensors to avoid multiple kernel launches
             params = group["params"]
             views = group["param_views"]
-
-            # Avoid casting if the parameter is already bfloat16
-            if updates_flat.dtype == params[0].dtype:
-                torch._foreach_add_(params, views, alpha=-lr)
-            else:
-                # Cast quickly and apply fused update
-                casted_views = [v.to(dtype=p.dtype, non_blocking=True) for v, p in zip(views, params)]
-                torch._foreach_add_(params, casted_views, alpha=-lr)
+            if updates_flat.dtype != params[0].dtype:
+                views = [v.to(dtype=p.dtype, non_blocking=True) for v, p in zip(views, params)]
+            torch._foreach_add_(params, views, alpha=-lr)
 
         return loss
 
@@ -591,23 +579,37 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
-        self.rank = rank
-        self.world_size = world_size
-        self.device = device
+        self.rank, self.world_size, self.device = rank, world_size, device
         self.stream = TokenStream(pattern)
+        self.next_x, self.next_y = None, None
+        # Create a separate CUDA stream for background transfers
+        self.transfer_stream = torch.cuda.Stream(device)
+
+    def preload(self, global_tokens: int, seq_len: int, grad_accum_steps: int):
+        with torch.cuda.stream(self.transfer_stream):
+            local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+            per_rank_span = local_tokens + 1
+            chunk = self.stream.take(per_rank_span * self.world_size)
+            start = self.rank * per_rank_span
+            
+            # This transfer now happens entirely in the background
+            local = chunk[start : start + per_rank_span].pin_memory().to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+            self.next_x = local[:-1].reshape(-1, seq_len)
+            self.next_y = local[1:].reshape(-1, seq_len)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        # Combine dtype conversion + device transfer in single operation
-        local = chunk[start : start + per_rank_span].pin_memory().to(device=self.device, dtype=torch.int64, non_blocking=True)
-        x = local[:-1].reshape(-1, seq_len)
-        y = local[1:].reshape(-1, seq_len)
+        if self.next_x is None:
+            self.preload(global_tokens, seq_len, grad_accum_steps)
+            
+        # Ensure the default stream waits for the background transfer to finish
+        torch.cuda.current_stream().wait_stream(self.transfer_stream)
+        x, y = self.next_x, self.next_y
+        
+        # Immediately queue up the next batch in the background
+        self.preload(global_tokens, seq_len, grad_accum_steps)
         return x, y
 
 # -----------------------------
@@ -648,10 +650,24 @@ class Rotary(nn.Module):
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     rotary_dim = cos.shape[-1] * 2
-    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
-    x1, x2 = x_rot.chunk(2, dim=-1)
-    x_rotated = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
-    return torch.cat((x_rotated, x_pass), dim=-1)
+    half_dim = rotary_dim // 2
+    
+    # 1. Allocate the final tensor exactly once
+    out = torch.empty_like(x)
+    
+    # 2. View extraction (essentially zero cost)
+    x1 = x[..., :half_dim]
+    x2 = x[..., half_dim:rotary_dim]
+    
+    # 3. Write math directly into the output tensor's memory
+    out[..., :half_dim] = x1 * cos - x2 * sin
+    out[..., half_dim:rotary_dim] = x1 * sin + x2 * cos
+    
+    # 4. Copy pass-through features (if using partial RoPE)
+    if x.shape[-1] > rotary_dim:
+        out[..., rotary_dim:] = x[..., rotary_dim:]
+        
+    return out
 
 
 class CausalSelfAttention(nn.Module):
@@ -742,8 +758,8 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
         attn_out = self.attn(self.attn_norm(x), emb)
-        y = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        return self.resid_scale.to(dtype=x.dtype)[None, None, :] * x + y + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(y))
+        y = x + self.attn_scale[None, None, :] * attn_out
+        return self.resid_scale[None, None, :] * x + y + self.mlp_scale[None, None, :] * self.mlp(self.mlp_norm(y))
 
 
 def get_linear_progression_kv_heads(layer_idx, total_layers, num_heads):
@@ -814,7 +830,7 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else nn.Linear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        apply_zero_init(self)
+        apply_zero_init(self, std=self.tied_embed_init_std)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         emb = self.tok_emb(input_ids)
@@ -861,6 +877,13 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    # 1. Force the PyTorch dispatcher to use Tensor Cores for all matmuls
+    torch.set_float32_matmul_precision('high')
+    import torch._inductor.config as inductor_config
+    inductor_config.fx_graph_cache = True               # Caches compiled kernels to disk (saves 5+ minutes on restart)
+    inductor_config.triton.unique_kernel_names = True   # Prevents Triton kernel namespace collisions in DDP
+    inductor_config.freezing = True                     # Aggressive constant-folding for inference/eval
+
     if distributed:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
