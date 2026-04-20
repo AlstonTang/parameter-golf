@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 import zlib
+import concurrent.futures
 from pathlib import Path
 
 import numpy as np
@@ -72,10 +73,10 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.03))
     head_lr = float(os.environ.get("HEAD_LR", 0.03))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.015))
-    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.0075))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.06))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.01))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.02))
+    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.05))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.03))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 4))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -154,7 +155,7 @@ def apply_zero_init(model, std=0.02):
                 
                 # The 'Exit' layer is the last Linear in this specific module
                 if i == len(linears) - 1:
-                    nn.init.zeros_(l.weight)
+                    nn.init.normal_(l.weight, std=1e-5)
                 # 'Internal' layers get Hadamard symmetry breaking
                 else:
                     H = get_hadamard_matrix(max(d_out, d_in), l.weight.device)
@@ -548,20 +549,30 @@ def load_data_shard(file: Path) -> Tensor:
 
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
         self.file_idx = 0
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        
+        # Initial load and pre-queue the NEXT file
         self.tokens = load_data_shard(self.files[0])
+        self.future_tokens = self._queue_next_file()
         self.pos = 0
+
+    def _queue_next_file(self):
+        next_idx = (self.file_idx + 1) % len(self.files)
+        return self.executor.submit(load_data_shard, self.files[next_idx])
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = load_data_shard(self.files[self.file_idx])
+        # result() will block ONLY if the disk is slower than your training 
+        # (unlikely with NVMe), otherwise it returns instantly.
+        self.tokens = self.future_tokens.result()
         self.pos = 0
+        # Start loading the one AFTER this
+        self.future_tokens = self._queue_next_file()
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
@@ -583,7 +594,6 @@ class DistributedTokenLoader:
         self.rank, self.world_size, self.device = rank, world_size, device
         self.stream = TokenStream(pattern)
         self.next_x, self.next_y = None, None
-        # Create a separate CUDA stream for background transfers
         self.transfer_stream = torch.cuda.Stream(device)
 
     def preload(self, global_tokens: int, seq_len: int, grad_accum_steps: int):
@@ -593,12 +603,13 @@ class DistributedTokenLoader:
             chunk = self.stream.take(per_rank_span * self.world_size)
             start = self.rank * per_rank_span
             
-            # This transfer now happens entirely in the background
+            # OPTIMIZATION: Move to device as int32 (4 bytes) instead of int64 (8 bytes)
             local = chunk[start : start + per_rank_span].pin_memory().to(
-                device=self.device, dtype=torch.int64, non_blocking=True
+                device=self.device, dtype=torch.int32, non_blocking=True
             )
+            # Embedding layer handles int32 perfectly.
             self.next_x = local[:-1].reshape(-1, seq_len)
-            self.next_y = local[1:].reshape(-1, seq_len)
+            self.next_y = local[1:].reshape(-1, seq_len).to(torch.long) # CrossEntropy needs long
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         if self.next_x is None:
@@ -752,9 +763,9 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, seq_len, use_rope, rope_proportion)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(0.1))
         self.resid_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(resid_scale))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(0.1))
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
         attn_out = self.attn(self.attn_norm(x), emb)
