@@ -58,7 +58,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.1))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.25))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -785,9 +785,9 @@ def get_linear_progression_kv_heads(layer_idx, total_layers, num_heads):
     valid_kvs = [i for i in range(1, num_heads + 1) if num_heads % i == 0]
     kv_heads = min(valid_kvs, key=lambda x: abs(x - raw_kv))
     
-    return int(max(1, kv_heads))
+    return int(max(min_kv, kv_heads))
 
-def get_rope_p_smooth(i: int, num_layers: int, p_min=0.25, p_max=0.75) -> float:
+def get_rope_p_smooth(i: int, num_layers: int, p_min=0.5, p_max=0.75) -> float:
     if num_layers <= 1:
         return p_min
     progress = i / (num_layers - 1)
