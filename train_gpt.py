@@ -49,7 +49,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 10))
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 20))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -62,7 +62,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -839,6 +839,7 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else nn.Linear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.skip_scales = nn.Parameter(torch.zeros(num_layers // 2))
         apply_zero_init(self, std=self.tied_embed_init_std)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -846,13 +847,15 @@ class GPT(nn.Module):
         x = F.rms_norm(emb, (emb.size(-1),))
 
         skips = []
+        half = len(self.blocks) // 2
         for i, block in enumerate(self.blocks):
-            if i < len(self.blocks):                     # Layers 0, 1, 2, 3
-                skips.append(x)           # Just saves a reference to the tensor in memory
-            elif i >= len(self.blocks):                  # Layers 4, 5, 6, 7
-                x = x + skips.pop()       # A simple element-wise addition
+            if i < half:
+                skips.append(x)
+            else:
+                scale = self.skip_scales[i - half]
+                x = x + scale * skips.pop()
             
-            x = block(x, emb)             # The actual Transformer Block computation
+            x = block(x, emb)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
