@@ -62,11 +62,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 8))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 8))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 2))
+    mlp_mult = float(os.environ.get("MLP_MULT", 1.4))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 4096.0))
 
@@ -692,7 +692,6 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(dim, self.kv_dim, bias=False)
         self.v_mix = nn.Parameter(torch.zeros(dim))
         self.proj = nn.Linear(dim, dim, bias=False)
-        self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, max_seq_len=seq_len, p=rope_proportion, base=rope_base)
         self.use_rope = use_rope
@@ -726,22 +725,16 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
-def calculate_hidden(mlp_mult: float, dim: int):
-    raw_hidden = int(mlp_mult * dim // 1.5)
-    multiplier = raw_hidden / 64
-    return 64 if multiplier == 0 else (2**round(math.log2(multiplier))) * 64
-
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        self.fused_down = nn.Linear(dim, 2 * calculate_hidden(mlp_mult, dim), bias=False)
-        self.w_u = nn.Linear(calculate_hidden(mlp_mult, dim), dim, bias=False)
-        self.w_u._zero_init = True # For ZerO Init
+        hidden_dim = int(mlp_mult * dim // 64) * 64
+        self.input = nn.Linear(dim, hidden_dim, bias=False)
+        self.out = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        gate, val = self.fused_down(x).chunk(2, dim=-1)
-        hidden = F.silu(gate) * val
-        return self.w_u(hidden)
+        x = torch.relu(self.input(x))
+        return self.out(x * x)
 
 
 class Block(nn.Module):
@@ -837,8 +830,6 @@ class GPT(nn.Module):
         ])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else nn.Linear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
         self.skip_scales = nn.Parameter(torch.zeros(num_layers // 2))
         apply_zero_init(self, std=self.tied_embed_init_std)
 
