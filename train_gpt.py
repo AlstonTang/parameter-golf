@@ -659,22 +659,16 @@ class Rotary(nn.Module):
     def forward(self):
         return self.cos, self.sin
 
+def rotate_half(x: Tensor):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     rotary_dim = cos.shape[-1] * 2
     x_ro = x[..., :rotary_dim]
-    x_pass = x[..., rotary_dim:] # Handles partial RoPE
-    
-    x1, x2 = x_ro.chunk(2, dim=-1)
-    
-    # Use concatenation instead of slice assignment
-    rotated = torch.cat([
-        x1 * cos - x2 * sin,
-        x1 * sin + x2 * cos
-    ], dim=-1)
-    
-    if x_pass.numel() > 0:
-        return torch.cat([rotated, x_pass], dim=-1)
-    return rotated
+    x_pass = x[..., rotary_dim:]
+    x_rotated = (x_ro * cos.repeat_interleave(2, dim=-1)) + (rotate_half(x_ro) * sin.repeat_interleave(2, dim=-1))
+    return torch.cat((x_rotated, x_pass), dim=-1)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, seq_len=1024, use_rope=True, rope_proportion=0.5):
@@ -695,8 +689,6 @@ class CausalSelfAttention(nn.Module):
         bsz, seqlen, dim = x.shape
         qk = self.c_qk(x)
         q, k = qk.split([dim, self.kv_dim], dim=-1)
-
-        mix = self.v_mix[None, None, :]
         v_input = (self.v_mix * x) + ((1.0 - self.v_mix) * emb)
         v = self.c_v(v_input)
 
@@ -820,7 +812,7 @@ class GPT(nn.Module):
                 rope_base,
                 qk_gain_init,
                 seq_len=seq_len,
-                use_rope=(i % 2 == 1),
+                use_rope=True,
                 resid_scale=1/math.sqrt(2 * num_layers),
                 rope_proportion=get_rope_p_smooth(i, num_layers)
             ) for i in range(num_layers)
@@ -974,9 +966,6 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         seq_len=args.train_seq_len
     ).to(device).bfloat16()
-    for module in base_model.modules():
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, gradient_as_bucket_view=True) if distributed else compiled_model
