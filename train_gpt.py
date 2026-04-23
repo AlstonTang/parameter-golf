@@ -696,13 +696,13 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.head_dim, max_seq_len=seq_len, p=rope_proportion, base=rope_base)
         self.use_rope = use_rope
 
-    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        bsz, seqlen, dim = x.shape
-        qk = self.c_qk(x)
+    def forward(self, x_unnorm: Tensor, x_norm: Tensor, emb: Tensor) -> Tensor:
+        bsz, seqlen, dim = x_norm.shape
+        qk = self.c_qk(x_norm)
         q, k = qk.split([dim, self.kv_dim], dim=-1)
 
         mix = self.v_mix[None, None, :]
-        v_input = (mix * x) + ((1.0-mix) * emb)
+        v_input = (mix * x_unnorm) + ((1.0-mix) * emb)
         v = self.c_v(v_input)
 
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -761,10 +761,11 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32).mul(0.1))
 
     def forward(self, x: Tensor, emb: Tensor) -> Tensor:
-        attn_out = self.attn(self.attn_norm(x), emb)
-        y = x + self.attn_scale[None, None, :] * attn_out
-        return self.resid_scale[None, None, :] * x + y + self.mlp_scale[None, None, :] * self.mlp(self.mlp_norm(y))
-
+        attn_out = self.attn(x, self.attn_norm(x), emb)
+        mlp_out = self.mlp(self.mlp_norm(x))
+        
+        # Parallel residual additions folded mathematically using (1.0 + resid_scale)
+        return (1.0 + self.resid_scale[None, None, :]) * x + self.attn_scale[None, None, :] * attn_out + self.mlp_scale[None, None, :] * mlp_out
 
 def get_linear_progression_kv_heads(layer_idx, total_layers, num_heads):
     # Progresses from 2 heads at layer 0 to num_heads at the final layer
